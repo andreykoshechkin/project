@@ -1,0 +1,57 @@
+@Slf4j
+@Component
+@RequiredArgsConstructor
+public class AiWebClient implements AiProcess<AiResponse, AiVerifyRequest> {
+
+    private final WebClient webClient;
+    private final DepositProperties depositProperties; // настройки из YAML
+    private final RequestHistService requestHistService;
+
+    @Override
+    public Mono<AiResponse> callFirstStage(AiVerifyRequest request) {
+        log.info("Запрос к FirstStage начат: {}", request);
+        return webClient.post()
+                .uri("/first-stage")
+                .bodyValue(request)
+                .retrieve()
+                .onStatus(HttpStatusCode::is5xxServerError,
+                        resp -> {
+                            log.warn("Получен 5xx от FirstStage: {}", resp.statusCode());
+                            return Mono.error(new AiWebClientException("Ошибка API FirstStage: " + resp.statusCode()));
+                        })
+                .bodyToMono(AiResponse.class)
+                .timeout(Duration.ofSeconds(depositProperties.getTimeoutSeconds()))
+                .transform(this::applyRetryIfEnabled)
+                .doOnSuccess(resp -> log.info("FirstStage успешно завершён: {}", resp))
+                .onErrorResume(throwable -> handleError("FirstStage", throwable));
+    }
+
+    private <T> Publisher<T> applyRetryIfEnabled(Publisher<T> source) {
+        if (!depositProperties.getRetry().isRetryEnabled()) {
+            log.info("Retry выключен, поток выполняется без повторов");
+            return source;
+        }
+
+        return Flux.from(source)
+                .retryWhen(Retry.backoff(
+                                depositProperties.getRetry().getMaxAttempts(),
+                                Duration.ofSeconds(depositProperties.getRetry().getIntervalSeconds()))
+                        .filter(e -> e instanceof AiWebClientException)
+                        .doBeforeRetry(retrySignal -> log.warn(
+                                "Повтор запроса #{}, причина: {}",
+                                retrySignal.totalRetries() + 1,
+                                retrySignal.failure().getMessage()
+                        ))
+                        .onRetryExhaustedThrow((spec, signal) -> {
+                            log.error("Все попытки исчерпаны, ошибка: {}", signal.failure().getMessage());
+                            return signal.failure();
+                        })
+                );
+    }
+
+    private <T> Mono<T> handleError(String stage, Throwable throwable) {
+        log.error("Произошла ошибка на этапе {}: {}", stage, throwable.getMessage());
+        return Mono.fromRunnable(() -> requestHistService.updateHistory("Произошла ошибка на " + stage))
+                   .then(Mono.error(throwable));
+    }
+}
