@@ -1,0 +1,107 @@
+Reactor Retry Guide
+
+Project Reactor: Retry (WebFlux) – Документация
+
+1. Введение
+Retry в Project Reactor позволяет повторять выполнение потоков Mono или Flux при ошибках. Это полезно для обращения к внешним сервисам, когда возможны временные сбои (например, 5xx ошибки).
+Основные цели:
+Повторить запрос при временной ошибке.
+Настроить задержку между попытками.
+Ограничить количество повторов.
+Обработать ошибку после исчерпания попыток.
+Шутка: Retry — это как кофе. Иногда нужно несколько попыток, чтобы наконец всё заработало.
+
+2. Основные методы
+2.1 retry(n)
+Простейший вариант. Повторяет поток n раз при любой ошибке.
+Mono.just("data")
+    .map(this::doSomething)
+    .retry(3); // повторяет 3 раза
+
+Шутка: Это как напоминание мамы — "Попробуй ещё раз!".
+
+2.2 retryWhen(Retry retrySpec)
+Более гибкий способ. Позволяет задавать количество попыток, задержку, фильтр исключений и поведение после исчерпания попыток.
+Mono.just("data")
+    .map(this::doSomething)
+    .retryWhen(
+        Retry.backoff(3, Duration.ofSeconds(1))
+             .filter(e -> e instanceof MyException)
+             .onRetryExhaustedThrow((spec, signal) -> signal.failure())
+    );
+
+3. Методы Retry (подробно)
+3.1 Retry.fixedDelay(long maxAttempts, Duration delay)
+Фиксированная задержка между попытками.
+Retry.fixedDelay(3, Duration.ofSeconds(5))
+     .filter(e -> e instanceof MyException)
+Повторяет максимум 3 раза с задержкой 5 секунд, только для MyException.
+
+3.2 Retry.backoff(long maxAttempts, Duration minBackoff)
+Экспоненциальный backoff: задержка увеличивается после каждой попытки.
+Retry.backoff(5, Duration.ofSeconds(1))
+     .filter(e -> e instanceof TimeoutException)
+5 попыток, минимальная задержка 1 секунда, задержка растёт экспоненциально. Шутка: Backoff — это как пытаться взять лифт, когда он занят. Сначала терпеливо ждём, потом чуть дольше, потом ещё дольше...
+
+3.3 doBeforeRetry(Consumer callback)
+Вызывается перед каждой повторной попыткой.
+.doBeforeRetry(retrySignal -> log.warn(
+    "Попытка #{}, причина: {}",
+    retrySignal.totalRetries() + 1,
+    retrySignal.failure().getMessage()
+))
+Шутка: doBeforeRetry — как короткий вдох перед прыжком с парашютом.
+
+3.4 onRetryExhaustedThrow(BiFunction<RetrySpec, RetrySignal, Throwable> exceptionMapper)
+Вызывается после исчерпания всех попыток.
+.onRetryExhaustedThrow((spec, signal) -> new RuntimeException("Все попытки исчерпаны", signal.failure()))
+Поток завершится исключением. Шутка: Это как последний кусок пиццы — если не успел, не жалуйся.
+
+3.5 filter(Predicate predicate)
+Фильтрует ошибки, для которых retry будет выполняться.
+.filter(e -> e instanceof AiWebClientException)
+Шутка: Мы фильтруем ошибки, как кофейные зёрна — только лучшие проходят.
+
+4. Пример с WebClient и retry
+webClient.get().uri("/api")
+    .retrieve()
+    .onStatus(HttpStatusCode::is5xxServerError,
+              resp -> Mono.error(new AiWebClientException("5xx ошибка")))
+    .bodyToMono(String.class)
+    .timeout(Duration.ofSeconds(20))
+    .retryWhen(
+        Retry.backoff(3, Duration.ofSeconds(15))
+             .filter(e -> e instanceof AiWebClientException)
+             .doBeforeRetry(retrySignal -> log.warn("Повтор запроса #{}: {}", retrySignal.totalRetries() + 1, retrySignal.failure().getMessage()))
+             .onRetryExhaustedThrow((spec, signal) -> signal.failure())
+    )
+    .onErrorResume(e -> {
+        requestHistService.updateHistory("Произошла ошибка");
+        return Mono.error(e);
+    });
+
+Объяснение:
+Таймаут запроса — 20 секунд.
+Retry включается только для AiWebClientException.
+Повторяется 3 раза с интервалом 15 секунд.
+Логи показывают каждый retry и причину.
+После всех попыток вызывается requestHistService.updateHistory.
+
+5. Советы по использованию
+Фильтруйте исключения — не делайте retry на все ошибки (например, 4xx не имеет смысла повторять).
+Ставьте таймаут больше интервала retry, иначе поток может завершиться по таймауту раньше.
+Используйте onErrorResume для fallback, логирования или обновления истории.
+При экспоненциальном backoff добавляйте jitter, чтобы избежать всплеска запросов.
+Шутка: Retry — как жизнь, иногда нужно просто попробовать ещё раз (или пять).
+
+6. Мини-схема логики Retry
+Отправляем запрос.
+Если ошибка подходит под фильтр:
+Ждём задержку.
+Повторяем запрос.
+Если количество попыток исчерпано:
+Выбрасываем исключение.
+Выполняем onErrorResume (например, обновляем историю или делаем fallback).
+Если запрос успешен — продолжаем выполнение.
+
+Конец документации.
