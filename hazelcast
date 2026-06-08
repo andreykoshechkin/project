@@ -1,0 +1,70 @@
+public class FnsState implements Serializable {
+    private final String status;
+    private final Instant lastStatusChangeTime;
+    private final boolean isStable;
+    private final boolean ignoreCheck; // Храним актуальный флаг прямо здесь!
+
+    public FnsState(String status, Instant lastStatusChangeTime, boolean isStable, boolean ignoreCheck) {
+        this.status = status;
+        this.lastStatusChangeTime = lastStatusChangeTime;
+        this.isStable = isStable;
+        this.ignoreCheck = ignoreCheck;
+    }
+    // геттеры...
+}
+public class FnsStateProcessor implements EntryProcessor<String, FnsState, ActionRequired> {
+    private final String incomingStatus;
+    private static final String CANNOT_CHECK = "CANNOT_CHECK";
+    private static final long THRESHOLD_MINUTES = 10;
+
+    public FnsStateProcessor(String incomingStatus) {
+        this.incomingStatus = incomingStatus;
+    }
+
+    @Override
+    public ActionRequired process(Map.Entry<String, FnsState> entry) {
+        Instant now = Instant.now();
+        FnsState oldState = entry.getValue();
+
+        if (oldState == null) {
+            // Инициализация при первом запуске (допустим, изначально игнор выключен)
+            entry.setValue(new FnsState(incomingStatus, now, true, false));
+            return ActionRequired.DO_NOTHING;
+        }
+
+        // Читаем ЖЕСТКО АКТУАЛЬНЫЙ флаг, так как мы находимся внутри потока Hazelcast
+        boolean currentIgnoreCheck = oldState.isIgnoreCheck(); 
+        
+        long minutesInState = Duration.between(oldState.getLastStatusChangeTime(), now).toMinutes();
+        boolean isTimePassed = minutesInState >= THRESHOLD_MINUTES;
+
+        if (CANNOT_CHECK.equals(incomingStatus)) {
+            if (!currentIgnoreCheck) {
+                if (isTimePassed) {
+                    // Атомарно меняем флаг внутри Hazelcast на true
+                    entry.setValue(new FnsState(CANNOT_CHECK, now, true, true));
+                    return ActionRequired.SWITCH_TO_IGNORE_TRUE;
+                } else {
+                    entry.setValue(new FnsState(CANNOT_CHECK, oldState.getLastStatusChangeTime(), false, currentIgnoreCheck));
+                    return ActionRequired.DO_NOTHING;
+                }
+            }
+            // ... остальная симметричная логика
+        }
+        // ... логика для рабочих статусов
+        return ActionRequired.DO_NOTHING;
+    }
+}
+public void processIncomingStatus(String incomingStatus) {
+    // Никаких чтений ДО процессора!
+    ActionRequired action = stateMap.executeOnKey(STATE_KEY, new FnsStateProcessor(incomingStatus));
+
+    // Синхронизируем состояние с БД/внешним сервисом без рисков для Hazelcast
+    if (action == ActionRequired.SWITCH_TO_IGNORE_TRUE) {
+        sysParamService.changeSysParam(true); // Обновляем БД постфактум
+        sendNotification("Режим игнорирования ВКЛЮЧЕН.");
+    } else if (action == ActionRequired.SWITCH_TO_IGNORE_FALSE) {
+        sysParamService.changeSysParam(false);
+        sendNotification("Режим игнорирования ВЫКЛЮЧЕН.");
+    }
+}
