@@ -1,0 +1,61 @@
+// FnsController.java
+package com.example.hazelcast.controller;
+
+import com.example.hazelcast.model.FintenderResponseStatus;
+import com.example.hazelcast.model.FnsState;
+import com.example.hazelcast.service.DepositFnsService;
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.map.IMap;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.web.bind.annotation.*;
+
+import java.time.Instant;
+import java.util.HashMap;
+import java.util.Map;
+
+@Slf4j
+@RestController
+@RequestMapping("/api/fns")
+@RequiredArgsConstructor
+public class FnsController {
+    
+    private final DepositFnsService depositFnsService;
+    private final HazelcastInstance hazelcastInstance;
+    
+    @PostMapping("/status")
+    public Map<String, Object> processStatus(@RequestParam FintenderResponseStatus status) {
+        String nodeId = hazelcastInstance.getCluster().getLocalMember().getUuid().substring(0, 8);
+        log.info("🌐 [{}] Получен REST запрос на обработку статуса: {}", nodeId, status);
+        
+        long startTime = System.currentTimeMillis();
+        depositFnsService.execute(status);
+        long duration = System.currentTimeMillis() - startTime;
+        
+        IMap<String, FnsState> map = hazelcastInstance.getMap("fns-state-map");
+        FnsState state = map.get("FNS_STATE_KEY");
+        
+        Map<String, Object> response = new HashMap<>();
+        response.put("nodeId", nodeId);
+        response.put("status", status);
+        response.put("ignoreCheck", state != null && state.isIgnoreCheck());
+        response.put("lastStatus", state != null ? state.getLastStatus() : null);
+        response.put("durationMs", duration);
+        response.put("timestamp", Instant.now().toString());
+        
+        log.info("🌐 [{}] Ответ отправлен: {}", nodeId, response);
+        return response;
+    }
+    
+    @GetMapping("/state")
+    public Map<String, Object> getState() {
+        IMap<String, FnsState> map = hazelcastInstance.getMap("fns-state-map");
+        FnsState state = map.get("FNS_STATE_KEY");
+        
+        return Map.of(
+            "nodeId", hazelcastInstance.getCluster().getLocalMember().getUuid().substring(0, 8),
+            "state", state,
+            "clusterSize", hazelcastInstance.getCluster().getMembers().size()
+        );
+    }
+}
