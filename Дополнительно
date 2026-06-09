@@ -22,3 +22,28 @@
   [PROCESS] статус от шедулера = CANNOT_CHECK
   [PROCESS] Статус ИЗМЕНИЛСЯ!
   [PROCESS] Проверяем время...
+
+
+Время 00:00 - Приложение стартует:
+  Hazelcast IMap: [пусто]
+  
+Время 00:10 - Шедулер вызывает первый раз:
+  execute(OK)
+    ↓
+  stateMap.executeOnKey(STATE_KEY, processor)
+    ↓
+  На ноде-владельце: entry.getValue() → null
+    ↓
+  Выполняется инициализация:
+    entry.setValue(new FnsState("OK", now, true, false))
+    ↓
+  Hazelcast IMap: {"FNS_STATE_KEY": FnsState(lastStatus="OK", ignoreCheck=false)}
+  
+Время 00:20 - Шедулер вызывает второй раз:
+  execute(OK)
+    ↓
+  stateMap.executeOnKey(STATE_KEY, processor)
+    ↓
+  На ноде-владельце: entry.getValue() → FnsState(lastStatus="OK", ignoreCheck=false)
+    ↓
+  currentState НЕ null! (уже есть данные)
