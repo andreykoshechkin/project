@@ -1,0 +1,98 @@
+public class FnsStateProcessor implements EntryProcessor<String, FnsState, Action>, Serializable {
+    
+    private final FintenderResponseStatus incomingStatus;
+    private static final String CANNOT_CHECK = "CANNOT_CHECK";
+    private static final long THRESHOLD_MINUTES = 10;
+    
+    public FnsStateProcessor(FintenderResponseStatus incomingStatus) {
+        this.incomingStatus = incomingStatus;
+    }
+    
+    @Override
+    public Action process(Map.Entry<String, FnsState> entry) {
+        Instant now = Instant.now();
+        FnsState currentState = entry.getValue();
+        
+        // Инициализация
+        if (currentState == null) {
+            entry.setValue(new FnsState(incomingStatus.name(), now, true, false));
+            return Action.NO_CHANGE;
+        }
+        
+        String incomingStatusStr = incomingStatus.name();
+        String currentStatusStr = currentState.getLastStatus();
+        boolean currentIgnoreCheck = currentState.isIgnoreCheck();
+        
+        // Статус не изменился
+        if (incomingStatusStr.equals(currentStatusStr)) {
+            return Action.NO_CHANGE;
+        }
+        
+        long minutesInState = Duration.between(currentState.getLastStatusChangeTime(), now).toMinutes();
+        boolean isTimePassed = minutesInState >= THRESHOLD_MINUTES;
+        
+        // ВКЛЮЧАЕМ игнорирование
+        if (incomingStatus == FintenderResponseStatus.CANNOT_CHECK && 
+            !currentIgnoreCheck && 
+            isTimePassed) {
+            entry.setValue(new FnsState(incomingStatusStr, now, false, true));
+            return Action.ENABLE_IGNORE;
+        }
+        
+        // ВЫКЛЮЧАЕМ игнорирование
+        if (incomingStatus != FintenderResponseStatus.CANNOT_CHECK && 
+            currentIgnoreCheck && 
+            isTimePassed) {
+            entry.setValue(new FnsState(incomingStatusStr, now, true, false));
+            return Action.DISABLE_IGNORE;
+        }
+        
+        // Обновляем статус без изменения ignore флага
+        entry.setValue(new FnsState(
+            incomingStatusStr, 
+            currentState.getLastStatusChangeTime(), 
+            false, 
+            currentIgnoreCheck
+        ));
+        return Action.NO_CHANGE;
+    }
+}
+
+@Service
+@Slf4j
+public class DepositFnsService {
+    
+    private static final String STATE_KEY = "FNS_STATE_KEY";
+    private final IMap<String, FnsState> stateMap;
+    private final SysParamService sysParamService;
+    
+    public DepositFnsService(HazelcastInstance hazelcastInstance, 
+                              SysParamService sysParamService) {
+        this.stateMap = hazelcastInstance.getMap("fns-state-map");
+        this.sysParamService = sysParamService;
+    }
+    
+    public void execute(FintenderResponseStatus status) {
+        // 1. Атомарно обновляем состояние в Hazelcast
+        Action action = stateMap.executeOnKey(STATE_KEY, new FnsStateProcessor(status));
+        
+        // 2. Атомарно обновляем БД (только если нужно И обновление успешно)
+        if (action == Action.ENABLE_IGNORE && sysParamService.changeSysParam(true)) {
+            log.info("✅ Режим игнорирования ВКЛЮЧЕН для статуса: {}", status);
+            sendNotification("Режим игнорирования ВКЛЮЧЕН");
+        } 
+        else if (action == Action.DISABLE_IGNORE && sysParamService.changeSysParam(false)) {
+            log.info("✅ Режим игнорирования ВЫКЛЮЧЕН для статуса: {}", status);
+            sendNotification("Режим игнорирования ВЫКЛЮЧЕН");
+        }
+        else if (action == Action.ENABLE_IGNORE || action == Action.DISABLE_IGNORE) {
+            // Другая нода уже обновила БД (affected rows = 0)
+            log.debug("Другая нода уже изменила состояние БД для action: {}", action);
+        }
+    }
+    
+    private void sendNotification(String message) {
+        // Ваша логика уведомлений
+        log.info(message);
+    }
+}
