@@ -1,0 +1,24 @@
+ВЫЗОВ #1 (первый в истории):
+  [Шедулер] Статус от внешнего сервиса: OK
+  [execute] Получил статус: OK
+  [PROCESS] currentState = null (первый вызов в истории!)
+  [PROCESS] Создаем новое состояние со статусом: OK
+  [PROCESS] Возвращаем NO_CHANGE
+  [execute] Получил action: NO_CHANGE
+
+ВЫЗОВ #2 (через 10 секунд):
+  [Шедулер] Статус от внешнего сервиса: OK
+  [execute] Получил статус: OK
+  [PROCESS] currentState.lastStatus = OK
+  [PROCESS] currentState.ignoreCheck = false
+  [PROCESS] статус от шедулера = OK
+  [PROCESS] Статус не изменился → NO_CHANGE
+  [PROCESS] Возвращаем NO_CHANGE
+
+ВЫЗОВ #3 (через 10 секунд):
+  [Шедулер] Статус от внешнего сервиса: CANNOT_CHECK
+  [execute] Получил статус: CANNOT_CHECK
+  [PROCESS] currentState.lastStatus = OK
+  [PROCESS] статус от шедулера = CANNOT_CHECK
+  [PROCESS] Статус ИЗМЕНИЛСЯ!
+  [PROCESS] Проверяем время...
