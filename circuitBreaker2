@@ -1,0 +1,202 @@
+package com.example.hazelcast.service;
+
+import io.github.resilience4j.circuitbreaker.CircuitBreaker;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig;
+import io.github.resilience4j.circuitbreaker.CircuitBreakerRegistry;
+import com.hazelcast.core.HazelcastInstance;
+import com.hazelcast.map.IMap;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.stereotype.Service;
+
+import javax.annotation.PostConstruct;
+import java.time.Duration;
+import java.time.Instant;
+import java.util.concurrent.atomic.AtomicInteger;
+
+@Service
+@Slf4j
+public class DepositFnsService {
+    
+    private static final String STATE_KEY = "FNS_STATE_KEY";
+    private final IMap<String, FnsState> stateMap;
+    private final SysParamService sysParamService;
+    private final CircuitBreaker circuitBreaker;
+    
+    // Счетчик вызовов для демонстрации
+    private final AtomicInteger callCounter = new AtomicInteger(0);
+    
+    public DepositFnsService(HazelcastInstance hazelcastInstance, 
+                              SysParamService sysParamService) {
+        this.stateMap = hazelcastInstance.getMap("fns-state-map");
+        this.sysParamService = sysParamService;
+        
+        // ========== НАСТРОЙКА CIRCUIT BREAKER ==========
+        CircuitBreakerConfig config = CircuitBreakerConfig.custom()
+            .slidingWindowSize(10)           // Смотрим последние 10 вызовов
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.COUNT_BASED)
+            .failureRateThreshold(70)        // При 70% ошибок открываем
+            .minimumNumberOfCalls(5)         // Минимум 5 вызовов для расчета
+            .waitDurationInOpenState(Duration.ofSeconds(30))  // OPEN 30 секунд
+            .permittedNumberOfCallsInHalfOpenState(3)  // 3 тестовых вызова
+            .maxWaitDurationInHalfOpenState(Duration.ofSeconds(10))
+            .build();
+        
+        CircuitBreakerRegistry registry = CircuitBreakerRegistry.of(config);
+        this.circuitBreaker = registry.circuitBreaker("fns-service");
+        
+        // ========== ПОДПИСКА НА СОБЫТИЯ ==========
+        // Слушаем изменения состояния Circuit Breaker
+        this.circuitBreaker.getEventPublisher()
+            .onStateTransition(event -> {
+                CircuitBreaker.State from = event.getStateTransition().getFromState();
+                CircuitBreaker.State to = event.getStateTransition().getToState();
+                
+                log.info("🔔 СОБЫТИЕ: Circuit Breaker переключился из {} в {}", from, to);
+                
+                // При переключении в OPEN - включаем игнорирование
+                if (to == CircuitBreaker.State.OPEN) {
+                    log.info("🔴 ОТКРЫТИЕ: Включаем игнорирование проверок");
+                    boolean updated = sysParamService.changeSysParam(true);
+                    if (updated) {
+                        sendNotification("🔴 Circuit Breaker OPEN - игнорирование ВКЛЮЧЕНО");
+                    }
+                }
+                
+                // При переключении в CLOSED - выключаем игнорирование
+                if (to == CircuitBreaker.State.CLOSED && from != CircuitBreaker.State.CLOSED) {
+                    log.info("🟢 ЗАКРЫТИЕ: Выключаем игнорирование проверок");
+                    boolean updated = sysParamService.changeSysParam(false);
+                    if (updated) {
+                        sendNotification("🟢 Circuit Breaker CLOSED - игнорирование ВЫКЛЮЧЕНО");
+                    }
+                }
+                
+                // HALF-OPEN - промежуточное состояние
+                if (to == CircuitBreaker.State.HALF_OPEN) {
+                    log.info("🟡 ПОЛУОТКРЫТО: Пытаемся восстановиться");
+                }
+            });
+        
+        // Слушаем ошибки для отладки
+        this.circuitBreaker.getEventPublisher()
+            .onError(event -> {
+                log.debug("❌ Зарегистрирована ошибка в Circuit Breaker");
+            });
+        
+        // Слушаем успехи для отладки
+        this.circuitBreaker.getEventPublisher()
+            .onSuccess(event -> {
+                log.debug("✅ Зарегистрирован успех в Circuit Breaker");
+            });
+    }
+    
+    /**
+     * ГЛАВНЫЙ МЕТОД - здесь происходит вся магия
+     * ВЫЗЫВАЕТСЯ ИЗ ШЕДУЛЕРА КАЖДЫЕ N СЕКУНД
+     */
+    public void execute(FintenderResponseStatus status) {
+        int callNumber = callCounter.incrementAndGet();
+        
+        log.info("╔════════════════════════════════════════════════════════════╗");
+        log.info("║ ВЫЗОВ #{}                                              ║", callNumber);
+        log.info("╠════════════════════════════════════════════════════════════╣");
+        log.info("║ Статус от внешнего сервиса: {}                              ║", status);
+        log.info("║ Текущее состояние CB: {}                               ║", circuitBreaker.getState());
+        log.info("╚════════════════════════════════════════════════════════════╝");
+        
+        // ========== ШАГ 1: ПРОВЕРЯЕМ, ПРОПУСКАЕТ ЛИ CB ВЫЗОВ ==========
+        // Circuit Breaker сам решает, пропустить вызов или нет
+        // Если состояние OPEN - вызов даже не дойдет до логики!
+        
+        if (circuitBreaker.getState() == CircuitBreaker.State.OPEN) {
+            log.info("🚫 Circuit Breaker OPEN - вызов блокирован!");
+            log.info("   Игнорируем проверку внешнего сервиса");
+            // Вызов не доходит до внешнего сервиса
+            return;
+        }
+        
+        // ========== ШАГ 2: ПОЛУЧАЕМ ТЕКУЩУЮ СТАТИСТИКУ ==========
+        CircuitBreaker.Metrics metrics = circuitBreaker.getMetrics();
+        log.info("📊 Статистика ДО вызова:");
+        log.info("   - Успешных вызовов в окне: {}", metrics.getNumberOfSuccessfulCalls());
+        log.info("   - Ошибочных вызовов в окне: {}", metrics.getNumberOfFailedCalls());
+        log.info("   - Всего вызовов в окне: {}", metrics.getNumberOfSuccessfulCalls() + metrics.getNumberOfFailedCalls());
+        log.info("   - Текущий процент ошибок: {}%", metrics.getFailureRate());
+        
+        // ========== ШАГ 3: ВЫЗЫВАЕМ ВНЕШНИЙ СЕРВИС (или симулируем) ==========
+        // Здесь должна быть реальная проверка внешнего сервиса
+        // Для примера используем переданный статус
+        
+        boolean isError = (status == FintenderResponseStatus.CANNOT_CHECK || 
+                          status == FintenderResponseStatus.TIMEOUT);
+        
+        log.info("🎯 Результат вызова: {}", isError ? "ОШИБКА" : "УСПЕХ");
+        
+        // ========== ШАГ 4: РЕГИСТРИРУЕМ РЕЗУЛЬТАТ В CIRCUIT BREAKER ==========
+        // ВОТ ЗДЕСЬ ПРОИСХОДИТ ВОЛШЕБСТВО!
+        // Circuit Breaker сам считает проценты и сам решает переключаться
+        
+        long startTime = System.currentTimeMillis();
+        
+        if (isError) {
+            // Регистрируем ошибку
+            circuitBreaker.onError(startTime, new RuntimeException("Статус: " + status));
+            log.info("❌ Зарегистрировали ОШИБКУ в Circuit Breaker");
+        } else {
+            // Регистрируем успех
+            circuitBreaker.onSuccess(startTime, null);
+            log.info("✅ Зарегистрировали УСПЕХ в Circuit Breaker");
+        }
+        
+        // ========== ШАГ 5: СМОТРИМ, ИЗМЕНИЛОСЬ ЛИ СОСТОЯНИЕ ==========
+        CircuitBreaker.State newState = circuitBreaker.getState();
+        
+        if (newState != circuitBreaker.getState()) {
+            // Это не сработает, т.к. мы уже получили новое состояние выше
+            // Но для примера оставляем
+        }
+        
+        log.info("📊 Статистика ПОСЛЕ вызова:");
+        metrics = circuitBreaker.getMetrics();
+        log.info("   - Успешных вызовов в окне: {}", metrics.getNumberOfSuccessfulCalls());
+        log.info("   - Ошибочных вызовов в окне: {}", metrics.getNumberOfFailedCalls());
+        log.info("   - Всего вызовов в окне: {}", metrics.getNumberOfSuccessfulCalls() + metrics.getNumberOfFailedCalls());
+        log.info("   - Текущий процент ошибок: {}%", metrics.getFailureRate());
+        log.info("🔥 Новое состояние CB: {}", newState);
+        
+        // ========== ШАГ 6: ЛОГИРУЕМ ПРИЧИНУ ПЕРЕКЛЮЧЕНИЯ ==========
+        if (newState == CircuitBreaker.State.OPEN) {
+            log.info("🔴🔴🔴 CIRCUIT BREAKER ОТКРЫЛСЯ! 🔴🔴🔴");
+            log.info("   Причина: процент ошибок ({}) >= порога (70%)", metrics.getFailureRate());
+            log.info("   Теперь все вызовы будут блокироваться на 30 секунд");
+        }
+        
+        if (newState == CircuitBreaker.State.HALF_OPEN) {
+            log.info("🟡🟡🟡 CIRCUIT BREAKER В ПОЛУОТКРЫТОМ СОСТОЯНИИ 🟡🟡🟡");
+            log.info("   Будет пропущено {} тестовых вызова для проверки", 
+                     circuitBreaker.getCircuitBreakerConfig().getPermittedNumberOfCallsInHalfOpenState());
+        }
+        
+        if (newState == CircuitBreaker.State.CLOSED && 
+            circuitBreaker.getState() == CircuitBreaker.State.HALF_OPEN) {
+            // Это состояние уже обработано в onStateTransition
+        }
+    }
+    
+    /**
+     * ВСПОМОГАТЕЛЬНЫЙ МЕТОД: Получить текущую статистику
+     */
+    public void printStatistics() {
+        CircuitBreaker.Metrics metrics = circuitBreaker.getMetrics();
+        log.info("========== СТАТИСТИКА CIRCUIT BREAKER ==========");
+        log.info("Состояние: {}", circuitBreaker.getState());
+        log.info("Успешных вызовов: {}", metrics.getNumberOfSuccessfulCalls());
+        log.info("Ошибочных вызовов: {}", metrics.getNumberOfFailedCalls());
+        log.info("Процент ошибок: {}%", metrics.getFailureRate());
+        log.info("================================================");
+    }
+    
+    private void sendNotification(String message) {
+        log.info("📧 УВЕДОМЛЕНИЕ: {}", message);
+    }
+}
